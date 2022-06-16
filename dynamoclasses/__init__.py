@@ -1,8 +1,11 @@
-
+import json
 from dataclasses import dataclass, asdict
 
 import boto3
 
+
+class ItemNotFoundError(Exception):
+    pass
 
 TYPE_MAPPING = {
     str: {"key": "S", "fn": lambda x: str(x)},
@@ -16,7 +19,7 @@ TYPE_MAPPING = {
 
 
 def _process_class(
-    cls, *, table_name, partition_key_name, sort_key_name, data_class_kwargs
+    cls, *, table_name, partition_key_name, sort_key_name, endpoint_url, region, data_class_kwargs
 ):
 
     data_class = dataclass(cls, **data_class_kwargs)
@@ -39,7 +42,11 @@ def _process_class(
         },
     )
 
-    setattr(data_class, "__dynamoclass_client__", boto3.client("dynamodb"))
+    client_kwargs = {}
+    if endpoint_url is not None:
+        client_kwargs["endpoint_url"] = endpoint_url
+
+    setattr(data_class, "__dynamoclass_client__", boto3.client("dynamodb", **client_kwargs))
 
     def _to_dynamo(self):
         return {
@@ -63,9 +70,12 @@ def _process_class(
                     f"No such field name found for {cls}!"
                 )
 
-            kwargs[field_name] = cls.__dataclass_fields__[field_name].type(
-                list(value.values())[0]
-            )
+            field_value =  list(value.values())[0]
+            if cls.__dataclass_fields__[field_name].type == dict:
+                field_value = json.loads(field_value)
+            kwargs[field_name] = cls.__dataclass_fields__[field_name].type(field_value)
+
+
         return kwargs
 
     @classmethod
@@ -94,26 +104,56 @@ def _process_class(
                 partition_key_name, partition_key
             )
         }
+
         if sort_key_name is not None:
             key[sort_key_name] = cls._dataclass_field_to_dynamo_field(
                 sort_key_name, sort_key
             )
+
         item = cls.__dynamoclass_client__.get_item(
             TableName=table_name, Key=key
         )
+
+        if "Item" not in item:
+            raise ItemNotFoundError(f"Item not found for {partition_key_name}={partition_key} in {table_name}")
         return cls(**cls._to_dataclass(item["Item"]))
+
+    @classmethod
+    def query(cls, *, partition_key, index=None):
+        partition_key_name = cls.__dynamoclass_params__["partition_key_name"]
+        sort_key_name = cls.__dynamoclass_params__["sort_key_name"]
+        table_name = cls.__dynamoclass_params__["table_name"]
+
+        extra_kwargs = {}
+        if index:
+            extra_kwargs["IndexName"] = index
+
+
+        partition_key_type = TYPE_MAPPING[cls.__dataclass_fields__[partition_key_name].type]["key"]
+        items = cls.__dynamoclass_client__.query(
+            TableName=table_name,
+            KeyConditionExpression=f"{partition_key_name} = :val",
+            ExpressionAttributeValues={
+                ":val": {partition_key_type: str(partition_key)}
+            },
+            **extra_kwargs
+        )
+
+        return [cls(**cls._to_dataclass(item)) for item in items["Items"]]
+
 
     data_class._to_dynamo = _to_dynamo
     data_class._to_dataclass = _to_dataclass
     data_class._dataclass_field_to_dynamo_field = _dataclass_field_to_dynamo_field
     data_class.save = save
     data_class.get = get
+    data_class.query = query
 
     return data_class
 
 
 def dynamoclass(
-    _cls=None, *, table_name=None, partition_key_name=None, sort_key_name=None, **kwargs
+    _cls=None, *, table_name=None, partition_key_name=None, sort_key_name=None, region=None, endpoint_url=None, **kwargs
 ):
 
     def wrap(cls):
@@ -122,6 +162,8 @@ def dynamoclass(
             table_name=table_name,
             partition_key_name=partition_key_name,
             sort_key_name=sort_key_name,
+            endpoint_url=endpoint_url,
+            region=region,
             data_class_kwargs=kwargs,
         )
 
